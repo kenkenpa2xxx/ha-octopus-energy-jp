@@ -82,17 +82,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     importer = OctopusStatisticsImporter(
         hass, entry.entry_id, coordinator.account_number
     )
+    cost_importer = OctopusStatisticsImporter(
+        hass,
+        entry.entry_id,
+        coordinator.account_number,
+        series="cost",
+    )
     await importer.async_load()
+    await cost_importer.async_load()
     last_signature: tuple | None = None
     hourly = _get_hourly(coordinator.data)
     if hourly is not None:
         await importer.async_import(hourly)
+        await cost_importer.async_import(hourly)
         last_signature = _hourly_signature(hourly)
 
     async def _safe_import(hourly_data: list) -> None:
         """例外を握り潰さずログに残す import ラッパー。"""
         try:
             await importer.async_import(hourly_data)
+            await cost_importer.async_import(hourly_data)
         except Exception:
             _LOGGER.exception("統計のインポートに失敗しました")
 
@@ -121,7 +130,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     entry.async_on_unload(coordinator.async_add_listener(_import_on_update))
 
-    entry.runtime_data = {"coordinator": coordinator, "importer": importer}
+    entry.runtime_data = {
+        "coordinator": coordinator,
+        "importer": importer,
+        "cost_importer": cost_importer,
+    }
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 
@@ -136,6 +149,7 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     for key in (
         f"{DOMAIN}_{entry.entry_id}_daily",
         f"{DOMAIN}_{entry.entry_id}_statistics",
+        f"{DOMAIN}_{entry.entry_id}_statistics_cost",
     ):
         try:
             await Store(hass, STORAGE_VERSION, key).async_remove()

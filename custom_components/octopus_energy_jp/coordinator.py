@@ -69,6 +69,51 @@ def _coerce_rates(raw_rates: Any) -> list[utils.RateTier]:
     return clean
 
 
+def _month_prior_daily_kwh(
+    daily_kwh: dict[str, float], month_key: str, day_str: str
+) -> float:
+    """Sum daily_kwh for strict-earlier days in the same local calendar month."""
+    return sum(v for d, v in daily_kwh.items() if d[:7] == month_key and d < day_str)
+
+
+def _attach_hourly_slot_costs(
+    hourly: list[dict[str, Any]],
+    daily_kwh: dict[str, float],
+    rates: list[utils.RateTier],
+    fuel_per_kwh: float,
+    levy_per_kwh: float,
+) -> list[dict[str, Any]]:
+    """Add per-slot marginal energy cost (JPY) for external cost statistics.
+
+    Each calendar month is processed independently in local time. For each
+    slot, cumulative energy before that slot is prior days in the month (from
+    ``daily_kwh``, including store-backfilled days) plus earlier slots the same
+    day. A slot's cost depends only on data at or before that slot, including
+    store-backfilled daily totals — never on how far back the API currently
+    returns data. Basic charge (CONF_BASIC_CHARGE_PER_DAY) is excluded — it
+    cannot be prorated per hour without breaking stability.
+    """
+    surcharge_per_kwh = fuel_per_kwh + levy_per_kwh
+    enriched: list[dict[str, Any]] = []
+    same_day_kwh: dict[str, float] = {}
+    for item in sorted(hourly, key=lambda row: row["start"]):
+        start = item["start"]
+        kwh = float(item["kwh"])
+        start_local = dt_util.as_local(start)
+        day_str = start_local.strftime("%Y-%m-%d")
+        month_key = start_local.strftime("%Y-%m")
+        cum_before = _month_prior_daily_kwh(daily_kwh, month_key, day_str) + (
+            same_day_kwh.get(day_str, 0.0)
+        )
+        energy = utils.tiered_cost(cum_before + kwh, rates) - utils.tiered_cost(
+            cum_before, rates
+        )
+        cost = round(energy + surcharge_per_kwh * kwh, 3)
+        same_day_kwh[day_str] = same_day_kwh.get(day_str, 0.0) + kwh
+        enriched.append({"start": start, "kwh": kwh, "cost": cost})
+    return enriched
+
+
 class OctopusEnergyJpCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Fetch readings and compute usage/cost aggregates."""
 
@@ -398,6 +443,36 @@ class OctopusEnergyJpCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     utils.coerce_option_float(options.get(CONF_RENEWABLE_LEVY_PER_KWH)),
                 )
 
+        options = self._entry.options
+        fuel_per_kwh = utils.coerce_option_float(
+            options.get(CONF_FUEL_ADJUSTMENT_PER_KWH)
+        )
+        levy_per_kwh = utils.coerce_option_float(
+            options.get(CONF_RENEWABLE_LEVY_PER_KWH)
+        )
+        hourly_base = [
+            {"start": start, "kwh": kwh} for start, kwh in sorted(hourly_kwh.items())
+        ]
+        hourly_with_cost = _attach_hourly_slot_costs(
+            hourly_base, daily_kwh, rates, fuel_per_kwh, levy_per_kwh
+        )
+        month_start_str = month_start.strftime("%Y-%m-%d")
+        has_current_month_days = any(day >= month_start_str for day in daily_kwh)
+        current_rate_kwh: float | None = None
+        current_rate_tier_kwh: float | None = None
+        current_rate_next_tier_kwh: float | None = None
+        current_rate_month_kwh: float | None = None
+        if has_current_month_days:
+            marginal = utils.marginal_rate_kwh(month_kwh, rates)
+            if marginal is not None:
+                current_rate_month_kwh = month_kwh
+                current_rate_tier_kwh = round(marginal, 2)
+                next_tier = utils.next_tier_rate_kwh(month_kwh, rates)
+                current_rate_next_tier_kwh = (
+                    round(next_tier, 2) if next_tier is not None else None
+                )
+                current_rate_kwh = round(marginal + fuel_per_kwh + levy_per_kwh, 2)
+
         return {
             "yesterday_kwh": yesterday_kwh,
             "today_kwh": today_kwh,
@@ -415,11 +490,14 @@ class OctopusEnergyJpCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "daily": daily,
             "yesterday_series": series_by_day.get(yesterday, []),
             "today_series": series_by_day.get(today, []),
-            "hourly": [
-                {"start": start, "kwh": kwh}
-                for start, kwh in sorted(hourly_kwh.items())
-            ],
+            "hourly": hourly_with_cost,
             "plan_name": contract.get("plan_name"),
+            "current_rate_kwh": current_rate_kwh,
+            "current_rate_tier_kwh": current_rate_tier_kwh,
+            "current_rate_fuel_per_kwh": fuel_per_kwh,
+            "current_rate_levy_per_kwh": levy_per_kwh,
+            "current_rate_next_tier_kwh": current_rate_next_tier_kwh,
+            "current_rate_month_kwh": current_rate_month_kwh,
             "billing_period": billing_period,
             "billing": billing,
             "last_update": now.isoformat(),

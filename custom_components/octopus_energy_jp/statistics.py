@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import math
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 
 from homeassistant.components.recorder.models import (
     StatisticData,
@@ -18,9 +18,11 @@ from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN, STATS_IMPORT_BUFFER, STORAGE_VERSION
-from .utils import statistic_id_for_account
+from .utils import cost_statistic_id_for_account, statistic_id_for_account
 
 _LOGGER = logging.getLogger(__name__)
+
+SeriesKind = Literal["consumption", "cost"]
 
 
 class OctopusStatisticsImporter:
@@ -39,14 +41,36 @@ class OctopusStatisticsImporter:
     統計が互いを上書きしない。
     """
 
-    def __init__(self, hass: HomeAssistant, entry_id: str, account_number: str) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry_id: str,
+        account_number: str,
+        *,
+        series: SeriesKind = "consumption",
+    ) -> None:
         self._hass = hass
-        self._store: Store[dict[str, Any]] = Store(
-            hass, STORAGE_VERSION, f"{DOMAIN}_{entry_id}_statistics"
-        )
+        self._series = series
+        if series == "cost":
+            store_key = f"{DOMAIN}_{entry_id}_statistics_cost"
+            self._statistic_id = cost_statistic_id_for_account(DOMAIN, account_number)
+            self._statistic_name = f"Octopus Energy Japan cost ({account_number})"
+            self._unit_class: str | None = None
+            self._unit_of_measurement: str | None = None
+            self._value_key = "cost"
+            self._include_state = True
+        else:
+            store_key = f"{DOMAIN}_{entry_id}_statistics"
+            self._statistic_id = statistic_id_for_account(DOMAIN, account_number)
+            self._statistic_name = (
+                f"Octopus Energy Japan consumption ({account_number})"
+            )
+            self._unit_class = "energy"
+            self._unit_of_measurement = "kWh"
+            self._value_key = "kwh"
+            self._include_state = False
+        self._store: Store[dict[str, Any]] = Store(hass, STORAGE_VERSION, store_key)
         self._account_number = account_number
-        self._statistic_id = statistic_id_for_account(DOMAIN, account_number)
-        self._statistic_name = f"Octopus Energy Japan consumption ({account_number})"
         self._last_start: datetime | None = None
         self._earliest_start: datetime | None = None
         self._cumulative: float = 0.0
@@ -166,6 +190,7 @@ class OctopusStatisticsImporter:
         """Import newly settled hours from coordinator data."""
         if not isinstance(hourly, list):
             return
+        value_key = self._value_key
         now = dt_util.now()
         settled: list[dict[str, Any]] = []
         for item in hourly:
@@ -179,13 +204,13 @@ class OctopusStatisticsImporter:
             except Exception:  # noqa: BLE001 - defensive tz conversion
                 continue
             try:
-                kwh = float(item.get("kwh"))
+                amount = float(item.get(value_key))
             except (TypeError, ValueError):
                 continue
-            if not math.isfinite(kwh):
+            if not math.isfinite(amount):
                 continue
             if start_local + timedelta(hours=1) <= now - STATS_IMPORT_BUFFER:
-                settled.append({"start": start_local, "kwh": kwh})
+                settled.append({"start": start_local, value_key: amount})
         if not settled:
             return
         settled.sort(key=lambda s: s["start"])
@@ -207,8 +232,8 @@ class OctopusStatisticsImporter:
                 # 訂正追従の簡易策: settled が既知範囲全体を覆う場合、
                 # 既存累積と settled 合計の不整合は過去値の訂正とみなして
                 # settled 全体を再投入（上書き冪等）する
-                fresh_total = sum(s["kwh"] for s in settled)
-                expected = cumulative + sum(s["kwh"] for s in targets)
+                fresh_total = sum(s[value_key] for s in settled)
+                expected = cumulative + sum(s[value_key] for s in targets)
                 if abs(fresh_total - expected) > 1e-6:
                     _LOGGER.debug("Detected revised past readings; re-importing all")
                     cumulative = 0.0
@@ -219,13 +244,17 @@ class OctopusStatisticsImporter:
 
         points: list[StatisticData] = []
         for item in targets:
-            cumulative += item["kwh"]
-            points.append(
-                {
-                    "start": dt_util.as_utc(item["start"]),
-                    "sum": round(cumulative, 3),
-                }
-            )
+            delta = item[value_key]
+            cumulative += delta
+            point: StatisticData = {
+                "start": dt_util.as_utc(item["start"]),
+                "sum": round(cumulative, 3),
+            }
+            # Cost series carries interval deltas for the Energy Dashboard;
+            # consumption rows stay start+sum only so existing data is not rewritten.
+            if self._include_state:
+                point["state"] = round(delta, 3)
+            points.append(point)
 
         if not points:
             return
@@ -236,8 +265,8 @@ class OctopusStatisticsImporter:
             "name": self._statistic_name,
             "source": DOMAIN,
             "statistic_id": self._statistic_id,
-            "unit_class": "energy",
-            "unit_of_measurement": "kWh",
+            "unit_class": self._unit_class,
+            "unit_of_measurement": self._unit_of_measurement,
         }
         async_add_external_statistics(self._hass, metadata, points)
         self._last_start = targets[-1]["start"]

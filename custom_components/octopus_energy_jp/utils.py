@@ -37,6 +37,11 @@ def statistic_id_for_account(domain: str, account: str) -> str:
     return f"{domain}:{slugify_account(account)}_consumption"
 
 
+def cost_statistic_id_for_account(domain: str, account: str) -> str:
+    """Return the per-account external cost statistics ID for the Energy Dashboard."""
+    return f"{domain}:{slugify_account(account)}_cost"
+
+
 def normalize_rates(raw_rates: list[dict[str, Any]]) -> list[RateTier]:
     """Coerce tariff tiers to sorted (start, end, price) tuples.
 
@@ -98,6 +103,43 @@ def tiered_cost(total_kwh: float, rates: list[RateTier]) -> float:
         upper = total_kwh if end is None else min(total_kwh, end)
         cost += (upper - start) * price
     return cost
+
+
+def marginal_rate_kwh(total_kwh: float, rates: list[RateTier]) -> float | None:
+    """Return the marginal tier price for a month-to-date cumulative kWh.
+
+    Tiers use half-open intervals ``[start, end)``; ``end is None`` means no
+    upper bound. When cumulative usage exceeds every finite tier, the last
+    tier's price is returned. An empty ``rates`` list yields ``None``.
+    """
+    if not rates:
+        return None
+    for start, end, price in rates:
+        if end is None:
+            if total_kwh >= start:
+                return price
+            continue
+        if start <= total_kwh < end:
+            return price
+    return rates[-1][2]
+
+
+def next_tier_rate_kwh(total_kwh: float, rates: list[RateTier]) -> float | None:
+    """Return the price of the next tier above the current marginal tier.
+
+    Returns ``None`` when already in the last tier or when ``rates`` is empty.
+    """
+    if not rates:
+        return None
+    for index, (start, end, _price) in enumerate(rates):
+        in_tier = (end is None and total_kwh >= start) or (
+            end is not None and start <= total_kwh < end
+        )
+        if in_tier:
+            if index + 1 < len(rates):
+                return rates[index + 1][2]
+            return None
+    return None
 
 
 def chunk_date_range(
