@@ -17,8 +17,10 @@ Energy Dashboard 用の外部統計を提供します。
 
 - 前日/当日/当月の使用量 (kWh) と料金 (JPY) センサー
 - 前日比較・前月比較センサー
+- 現在の単価センサー（v0.4.0〜、段階制の限界単価＋燃料費調整額＋再エネ賦課金）
 - 請求期間の使用量・料金センサー（v0.2.3〜、基本料金・燃料費調整額・再エネ賦課金の加算に対応）
-- Energy Dashboard 連携（時間別消費量の外部統計を自動投入）
+- Energy Dashboard 連携（時間別の消費量と料金の外部統計を自動投入。料金統計は v0.4.0〜）
+- 資格情報の再設定（v0.4.0〜、削除せずにメールアドレス・パスワードを変更）
 - 段階制料金（グリーンオクトパス等）の料金計算
 - 日次履歴の永続化（API保持期間より古い分も保持）
 - 日英バイリンガル対応
@@ -30,6 +32,7 @@ Energy Dashboard 用の外部統計を提供します。
 - データ更新間隔は1時間です（Data refreshes hourly）。30分値は約8時間遅れで届きます。
 - 段階制料金プラン（グリーンオクトパス等）に対応。従量単価は Kraken API の料金表から取得します。
 - 複数契約がある場合、最初の供給地点のみ使用します（Only the first supply point is used）。
+- Energy Dashboard に料金を表示するには、HA の通貨設定（設定 → 一般 → 通貨 / Currency）が `JPY` である必要があります。
 - 不具合・要望は [Issues](https://github.com/tamatyan99/ha-octopus-energy-jp/issues) までお願いします。
 
 ## インストール
@@ -89,6 +92,11 @@ Energy Dashboard 用の外部統計を提供します。
 | 昨日の料金 / 当日の料金 / 当月の料金 / 前月の料金 | JPY | 段階制料金による概算 |
 | 請求期間の使用量 | kWh | 検針期間（billing）の累計使用量（センサーID: `billing_kwh`） |
 | 請求期間の料金 | JPY | 検針期間の概算料金。オプション設定時は基本料金・燃料費調整額・再エネ賦課金を加算（センサーID: `billing_cost`） |
+| 現在の単価 | JPY/kWh | 段階制の限界単価＋燃料費調整額＋再エネ賦課金（センサーID: `current_rate`）。属性に `tier_rate` / `next_tier_rate` / `plan_name` / `month_kwh` |
+
+`現在の単価`（`current_rate`）は当月の使用量から決まる**現在適用中の従量単価**で、
+「単価が安い時間帯に家電を回す」といった自動化に使えます。料金表の改定や当月累計が
+次の段階に入ると値が変わります。
 
 `昨日の使用量`（`yesterday_kwh`）センサーの属性には `avg_rate`（平均単価）、`daily`（日別使用量・料金）、
 `yesterday_series` / `today_series`（30分値系列）、`plan_name`、`last_update` も含まれます。
@@ -107,17 +115,25 @@ Energy Dashboard 用の外部統計を提供します。
 
 1. **設定 → ダッシュボード → エネルギー** を開きます
 2. 電力網の **消費量を追加** → ソースの一覧から `Octopus Energy Japan consumption` を選択します
-3. 複数契約がある場合は契約ごとの統計名（末尾に供給地点IDが付くもの）から該当する契約を選びます
-   （Select the statistic matching your supply point when multiple contracts exist）
-4. 保存すると時間別グラフに反映されます
+3. 複数の**口座番号**で連携している場合は、一覧に出る statistic_id（口座番号ごと。例: `octopus_energy_jp:a_b00c43a0_consumption` — 口座番号を小文字化し、英数字以外を `_` にした slug）から該当口座を選びます
+   （One statistic per account number; pick the matching `octopus_energy_jp:<account_slug>_consumption` when you have several accounts）
+   同一口座に複数の供給地点がある場合も statistic_id は1つです（連携は最初の供給地点のみ使用 — 前提と制限のとおり）。
+4. 料金も表示する場合は、同じ電力網の **コスト** で「**総コストを追跡するエンティティを使用**」（Use an entity tracking the total costs）を選び、`Octopus Energy Japan cost` を選択します（v0.4.0〜）
+5. 保存すると時間別グラフに反映されます
+
+> [!NOTE]
+> 料金統計（`Octopus Energy Japan cost`）は、確定済みの30分枠ごとの**従量料金**（段階制の限界単価）に
+> 燃料費調整額と再エネ賦課金を加えた額です。**基本料金（日払い分）は含みません**。
+> 単価は現在の料金表を用いるため、過去分は概算です（単価改定は考慮しません）。
+> 表示される通貨は HA の通貨設定に従います。
 
 > [!NOTE]
 > 確定済みの30分枠のみ統計に投入します（暫定の当日値は除外）。
 > そのため当日分は翌日以降に反映されます。
 
 > [!IMPORTANT]
-> v0.2.0 で外部統計の statistic_id が `octopus_energy_jp:consumption` から契約別の
-> `octopus_energy_jp:<供給地点ID>_consumption` に変更されました。v0.1 から更新した場合は
+> v0.2.0 で外部統計の statistic_id が `octopus_energy_jp:consumption` から口座番号別の
+> `octopus_energy_jp:<account_slug>_consumption`（例: `octopus_energy_jp:a_b00c43a0_consumption`）に変更されました。v0.1 から更新した場合は
 > Energy Dashboard の消費量ソースを選び直してください（旧統計は履歴として残ります）。
 
 > [!WARNING]
@@ -126,6 +142,11 @@ Energy Dashboard 用の外部統計を提供します。
 > 外部統計と併せて選ぶと**二重計上**になります。
 > `yesterday_kwh` / `prev_month_*` / `billing_*` / `cost_yesterday` / `prev_month_cost` は
 > 確定済み期間のスナップショットのため、長期統計を生成しません（履歴は recorder の通常履歴に残ります）。
+
+> [!NOTE]
+> コストの欄には料金統計（`Octopus Energy Japan cost`）を選んでください。消費量ソースが外部統計の場合、
+> HA は料金を単価エンティティや固定価格では計算できません（`cost_today` / `cost_month` などのセンサーは選択不可）。
+> 単価センサー（`current_rate`）は表示・自動化用で、Energy Dashboard の料金計算には使われません。
 
 ## トラブルシューティング / Troubleshooting
 
@@ -152,6 +173,29 @@ Energy Dashboard 用の外部統計を提供します。
 
 パスワード変更などで `invalid_auth` が出た場合は、統合エントリの再認証から再入力してください
 （設定 → デバイスとサービス → Octopus Energy Japan → ⋮ → 再認証 / Re-authenticate）。
+
+メールアドレスやパスワードを変更したい場合は、同じ ⋮ メニューの **再設定**（Reconfigure）を使うと
+エントリを削除せずに更新できます（v0.4.0〜。別アカウントの認証情報を入力した場合は拒否されます）。
+
+### v0.2.5 以降の「state class が削除されました」修復警告（v0.2.4 以前からの更新）
+
+v0.2.5 で、確定済み期間のスナップショット6センサーから `state_class` を意図的に外しました（`state_class: total` に有効な `last_reset` がなく、長期統計がマイナス等の不正値になる問題のため）。対象は次のとおりです（`sensor.octopus_energy_<account>_…`）。
+
+| センサー | entity_id 末尾 |
+|---|---|
+| 前日使用量 (`yesterday_kwh`) | `yesterday_usage` |
+| 前月使用量 (`prev_month_kwh`) | `previous_month_usage` |
+| 前日料金 (`cost_yesterday`) | `yesterday_cost` |
+| 前月料金 (`prev_month_cost`) | `previous_month_cost` |
+| 請求期間使用量 (`billing_kwh`) | `billing_period_usage` |
+| 請求期間料金 (`billing_cost`) | `billing_period_cost` |
+
+既に recorder に統計メタデータがある環境では、Home Assistant が **修復**（`sensor` ドメイン、翻訳キー `state_class_removed` / issue_id `state_class_removed_sensor.` 付き）を出し、「state class が削除され、長期統計は記録されなくなった」旨が表示されます。連携の不具合ではなく**想定どおりの動作**です。Energy Dashboard で使う長期統計は外部統計（**Octopus Energy Japan consumption**）に影響しません。
+
+**対処:** **設定 → システム → 修復**（Settings → System → Repairs）で該当項目を無視（Dismiss）してください。issue レジストリに `dismissed_version` が残るため、次回の統計コンパイルで再発しても通常は戻りません。
+
+> [!WARNING]
+> 任意で、上記6 entity の古い統計行だけを消すには、開発者ツール → サービスで `recorder.clear_statistics` を6つの `entity_id` に対して実行できます。**記録済み統計は永久に削除され、元に戻せません。**
 
 ### デバッグログ
 

@@ -2,13 +2,39 @@
 
 from __future__ import annotations
 
+from datetime import date, datetime
 from typing import Any
 
 from homeassistant.components.diagnostics import async_redact_data
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
+from .const import (
+    CONF_BASIC_CHARGE_PER_DAY,
+    CONF_FUEL_ADJUSTMENT_PER_KWH,
+    CONF_RENEWABLE_LEVY_PER_KWH,
+)
+
 TO_REDACT = {"password", "token", "email", "account_number"}
+
+_COORDINATOR_SUMMARY_KEYS = (
+    "plan_name",
+    "last_update",
+    "avg_rate",
+    "billing_period",
+    "billing",
+)
+
+
+def _json_safe(value: Any) -> Any:
+    """Recursively convert datetimes/dates so diagnostics stay JSON-serialisable."""
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 def _mask_account_number(value: Any) -> Any:
@@ -37,6 +63,15 @@ def _summarize_list(value: Any) -> Any:
     return value
 
 
+def _coordinator_summary(data: dict[str, Any]) -> dict[str, Any]:
+    """Small coordinator fields only (no large arrays)."""
+    summary: dict[str, Any] = {}
+    for key in _COORDINATOR_SUMMARY_KEYS:
+        if key in data:
+            summary[key] = _json_safe(data[key])
+    return summary
+
+
 async def async_get_config_entry_diagnostics(
     hass: HomeAssistant, entry: ConfigEntry
 ) -> dict[str, Any]:
@@ -55,8 +90,7 @@ async def async_get_config_entry_diagnostics(
         if key in ("daily", "yesterday_series", "today_series", "hourly"):
             summarized[key] = _summarize_list(value)
         else:
-            # billing / billing_period は小さなサマリーdictのためそのまま含める
-            summarized[key] = value
+            summarized[key] = _json_safe(value)
 
     entry_data = {
         "email": entry.data.get("email"),
@@ -76,7 +110,19 @@ async def async_get_config_entry_diagnostics(
             # async_redact_data は部分一致をマスクしないため自前マスクが必要。
             "title": _mask_account_number(entry.title),
             "data": redacted_entry,
+            "version": entry.version,
+            "unique_id": entry.unique_id,
+            "options": {
+                CONF_BASIC_CHARGE_PER_DAY: entry.options.get(CONF_BASIC_CHARGE_PER_DAY),
+                CONF_FUEL_ADJUSTMENT_PER_KWH: entry.options.get(
+                    CONF_FUEL_ADJUSTMENT_PER_KWH
+                ),
+                CONF_RENEWABLE_LEVY_PER_KWH: entry.options.get(
+                    CONF_RENEWABLE_LEVY_PER_KWH
+                ),
+            },
         },
+        "coordinator_summary": _coordinator_summary(data),
         "coordinator_data": async_redact_data(summarized, TO_REDACT),
     }
     return diagnostics

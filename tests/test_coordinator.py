@@ -21,6 +21,7 @@ from homeassistant.helpers.update_coordinator import UpdateFailed
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.octopus_energy_jp import utils as oejp_utils
 from custom_components.octopus_energy_jp.api import OctopusApiError, OctopusAuthError
 from custom_components.octopus_energy_jp.const import (
     CONF_ACCOUNT_NUMBER,
@@ -32,7 +33,9 @@ from custom_components.octopus_energy_jp.const import (
 )
 from custom_components.octopus_energy_jp.coordinator import (
     OctopusEnergyJpCoordinator,
+    _attach_hourly_slot_costs,
     _coerce_rates,
+    _month_prior_daily_kwh,
     _tiered_cost,
 )
 
@@ -642,3 +645,148 @@ def test_coerce_rates_branches() -> None:
     for bad in ([], "nope", None, [(1, 2)], [(5, 5, 1.0)]):
         with pytest.raises(ValueError):
             _coerce_rates(bad)
+
+
+# ---------------------------------------------------------------------------
+# Per-slot marginal hourly costs and current-rate sensors
+# ---------------------------------------------------------------------------
+
+TIERED_RATES: list[tuple[float, float | None, float]] = [
+    (0.0, 120.0, 30.0),
+    (120.0, 300.0, 36.0),
+    (300.0, None, 40.0),
+]
+
+
+def _july_hourly_slots(
+    day: str, total_kwh: float, slots: int = 4
+) -> list[dict[str, Any]]:
+    per = total_kwh / slots
+    tz = dt_util.get_time_zone("Asia/Tokyo")
+    assert tz is not None
+    out: list[dict[str, Any]] = []
+    for h in range(slots):
+        start = datetime.strptime(f"{day} {h:02d}:00:00", "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=tz
+        )
+        out.append({"start": start, "kwh": per})
+    return out
+
+
+def test_attach_hourly_slot_costs_sum_matches_tiered_plus_surcharge() -> None:
+    fuel, levy = 2.0, 3.0
+    july_days = {f"2026-07-{d:02d}": float(d) for d in range(1, 16)}
+    hourly: list[dict[str, Any]] = []
+    for day, kwh in sorted(july_days.items()):
+        hourly.extend(_july_hourly_slots(day, kwh))
+    enriched = _attach_hourly_slot_costs(hourly, july_days, TIERED_RATES, fuel, levy)
+    month_total = sum(july_days.values())
+    expected_energy = oejp_utils.tiered_cost(month_total, TIERED_RATES)
+    expected = expected_energy + (fuel + levy) * month_total
+    assert sum(row["cost"] for row in enriched) == pytest.approx(expected, rel=1e-6)
+    for row in enriched:
+        assert set(row) == {"start", "kwh", "cost"}
+
+
+def test_attach_hourly_slot_costs_uses_daily_kwh_for_prior_month_days() -> None:
+    """Mid-month hourly window with store-backfilled dailies prices higher tiers."""
+    fuel = levy = 0.0
+    daily = {f"2026-07-{d:02d}": 10.0 for d in range(1, 15)}  # 140 kWh before day 15
+    day15_only = _july_hourly_slots("2026-07-15", 15.0, slots=3)
+    enriched = _attach_hourly_slot_costs(day15_only, daily, TIERED_RATES, fuel, levy)
+    # First slot on the 15th: cumulative before = 140 kWh → tier-2 marginal (36)
+    first_cost = enriched[0]["cost"]
+    k0 = day15_only[0]["kwh"]
+    energy = oejp_utils.tiered_cost(140.0 + k0, TIERED_RATES) - oejp_utils.tiered_cost(
+        140.0, TIERED_RATES
+    )
+    assert first_cost == pytest.approx(energy, rel=1e-6)
+
+    full_hourly: list[dict[str, Any]] = []
+    for d in range(1, 15):
+        full_hourly.extend(_july_hourly_slots(f"2026-07-{d:02d}", 10.0, slots=1))
+    full_hourly.extend(day15_only)
+    enriched_full = _attach_hourly_slot_costs(
+        full_hourly, daily, TIERED_RATES, fuel, levy
+    )
+    target_start = day15_only[0]["start"]
+    by_start = {row["start"]: row["cost"] for row in enriched_full}
+    assert by_start[target_start] == pytest.approx(first_cost, rel=1e-6)
+
+
+def test_attach_hourly_slot_costs_tolerates_missing_daily_and_empty_daily() -> None:
+    slots = _july_hourly_slots("2026-07-15", 6.0, slots=2)
+    daily_missing_prior = {"2026-07-14": 5.0}  # gap: no 2026-07-01..13
+    out = _attach_hourly_slot_costs(slots, daily_missing_prior, TIERED_RATES, 1.0, 1.0)
+    assert len(out) == 2
+    out_empty = _attach_hourly_slot_costs(slots, {}, TIERED_RATES, 0.0, 0.0)
+    assert len(out_empty) == 2
+
+
+def test_month_prior_daily_kwh_sums_strictly_earlier_days() -> None:
+    daily = {
+        "2026-06-30": 9.0,
+        "2026-07-01": 1.0,
+        "2026-07-14": 14.0,
+        "2026-07-15": 15.0,
+    }
+    assert _month_prior_daily_kwh(daily, "2026-07", "2026-07-15") == pytest.approx(15.0)
+    assert _month_prior_daily_kwh(daily, "2026-06", "2026-06-30") == 0.0
+
+
+async def test_hourly_cost_excludes_basic_charge(hass: HomeAssistant) -> None:
+    july = {f"2026-07-{d:02d}": 5.0 for d in range(1, 16)}
+    readings = _half_hourly(july)
+    fuel_levy = {
+        CONF_FUEL_ADJUSTMENT_PER_KWH: 2.0,
+        CONF_RENEWABLE_LEVY_PER_KWH: 3.0,
+    }
+    coord_no_basic = _make_coordinator(hass, _new_entry(dict(fuel_levy)), readings)
+    coord_with_basic = _make_coordinator(
+        hass,
+        _new_entry({**fuel_levy, CONF_BASIC_CHARGE_PER_DAY: 99.0}),
+        readings,
+    )
+    with _frozen_jst():
+        no_basic = await coord_no_basic._async_update_data()
+        with_basic = await coord_with_basic._async_update_data()
+    assert no_basic["hourly"] == with_basic["hourly"]
+
+
+async def test_current_rate_keys_when_month_has_usage(hass: HomeAssistant) -> None:
+    coord = _make_coordinator(
+        hass,
+        _new_entry(
+            {
+                CONF_FUEL_ADJUSTMENT_PER_KWH: 2.0,
+                CONF_RENEWABLE_LEVY_PER_KWH: 3.0,
+            }
+        ),
+        _half_hourly(_fixed_days()),
+    )
+    with _frozen_jst():
+        data = await coord._async_update_data()
+    assert data["month_kwh"] == 120.0
+    assert data["current_rate_month_kwh"] == 120.0
+    assert data["current_rate_tier_kwh"] == 36.0
+    assert data["current_rate_next_tier_kwh"] == 40.0
+    assert data["current_rate_fuel_per_kwh"] == 2.0
+    assert data["current_rate_levy_per_kwh"] == 3.0
+    assert data["current_rate_kwh"] == 41.0
+
+
+async def test_current_rate_keys_none_without_current_month_days(
+    hass: HomeAssistant,
+) -> None:
+    june_only = {f"2026-06-{d:02d}": 4.0 for d in range(1, 31)}
+    coord = _make_coordinator(hass, _new_entry(), _half_hourly(june_only))
+    coord._stored_days = dict(june_only)
+    with _frozen_jst():
+        data = await coord._async_update_data()
+    assert data["month_kwh"] == 0.0
+    assert data["current_rate_kwh"] is None
+    assert data["current_rate_tier_kwh"] is None
+    assert data["current_rate_next_tier_kwh"] is None
+    assert data["current_rate_month_kwh"] is None
+    assert data["current_rate_fuel_per_kwh"] == 0.0
+    assert data["current_rate_levy_per_kwh"] == 0.0

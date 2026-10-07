@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
-from unittest.mock import AsyncMock, MagicMock, PropertyMock
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import aiohttp
 import pytest
@@ -26,12 +26,17 @@ PASSWORD = "secret"
 # ---------------------------------------------------------------------------
 
 
-def _ok_response(status: int = 200, payload: dict | None = None) -> MagicMock:
+def _ok_response(
+    status: int = 200,
+    payload: dict | None = None,
+    headers: dict[str, str] | None = None,
+) -> MagicMock:
     """Build a fake response with status/json()/text()."""
     resp = MagicMock()
     resp.status = status
     resp.json = AsyncMock(return_value=payload)
     resp.text = AsyncMock(return_value=str(payload))
+    resp.headers = headers or {}
     return resp
 
 
@@ -235,7 +240,7 @@ async def test_post_http_auth_status_raises_auth_error(status: int) -> None:
 
 async def test_post_http_other_status_raises_api_error() -> None:
     client, session = _client_with_posts(
-        [_context_manager_for(_ok_response(status=500))]
+        [_context_manager_for(_ok_response(status=404))]
     )
     with pytest.raises(OctopusApiError) as exc_info:
         await client._async_post({"query": "q"})
@@ -271,15 +276,19 @@ async def test_post_non_dict_payload_raises_api_error() -> None:
 
 
 async def test_post_transport_error_becomes_api_error() -> None:
-    client, _ = _client_with_posts([aiohttp.ClientError("connection reset")])
-    with pytest.raises(OctopusApiError):
-        await client._async_post({"query": "q"})
+    client, session = _client_with_posts([aiohttp.ClientError("connection reset")] * 3)
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        with pytest.raises(OctopusApiError):
+            await client._async_post({"query": "q"})
+    assert session.post.call_count == 3
 
 
 async def test_post_timeout_becomes_api_error() -> None:
-    client, _ = _client_with_posts([TimeoutError("timed out")])
-    with pytest.raises(OctopusApiError):
-        await client._async_post({"query": "q"})
+    client, session = _client_with_posts([TimeoutError("timed out")] * 3)
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        with pytest.raises(OctopusApiError):
+            await client._async_post({"query": "q"})
+    assert session.post.call_count == 3
 
 
 async def test_post_unexpected_error_is_wrapped() -> None:
@@ -300,6 +309,170 @@ async def test_post_key_error_propagates_unwrapped() -> None:
     client, _ = _client_with_posts([_context_manager_for(resp)])
     with pytest.raises(KeyError):
         await client._async_post({"query": "q"})
+
+
+# ---------------------------------------------------------------------------
+# Transient retry / backoff
+# ---------------------------------------------------------------------------
+
+
+async def test_post_retries_once_on_429_then_succeeds() -> None:
+    ok = {"data": {"viewer": {}}}
+    client, session = _client_with_posts(
+        [
+            _context_manager_for(_ok_response(status=429)),
+            _context_manager_for(_ok_response(payload=ok)),
+        ]
+    )
+    with patch("asyncio.sleep", new_callable=AsyncMock) as sleep_mock:
+        assert await client._async_post({"query": "q"}) == ok
+    assert session.post.call_count == 2
+    assert sleep_mock.call_count == 1
+
+
+async def test_post_exhausts_retries_on_persistent_503() -> None:
+    client, session = _client_with_posts(
+        [_context_manager_for(_ok_response(status=503))] * 3
+    )
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        with pytest.raises(OctopusApiError, match="HTTP 503"):
+            await client._async_post({"query": "q"})
+    assert session.post.call_count == 3
+
+
+async def test_post_honours_retry_after_header() -> None:
+    ok = {"data": {}}
+    client, session = _client_with_posts(
+        [
+            _context_manager_for(
+                _ok_response(status=503, headers={"Retry-After": "4"})
+            ),
+            _context_manager_for(_ok_response(payload=ok)),
+        ]
+    )
+    with patch("asyncio.sleep", new_callable=AsyncMock) as sleep_mock:
+        assert await client._async_post({"query": "q"}) == ok
+    assert session.post.call_count == 2
+    sleep_mock.assert_awaited_once()
+    delay = sleep_mock.await_args.args[0]
+    assert 2.0 <= delay <= 4.0
+
+
+async def test_post_retries_on_timeout_then_succeeds() -> None:
+    ok = {"data": {"ok": True}}
+    client, session = _client_with_posts(
+        [TimeoutError("timed out"), _context_manager_for(_ok_response(payload=ok))]
+    )
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        assert await client._async_post({"query": "q"}) == ok
+    assert session.post.call_count == 2
+
+
+async def test_query_401_reauth_not_counted_as_transient_retry_budget() -> None:
+    auth_payload = {"data": {"obtainKrakenToken": {"token": "new-token"}}}
+    data_payload = {"data": {"viewer": {"accounts": [{"number": "A-1"}]}}}
+    client, session = _client_with_posts(
+        [
+            _context_manager_for(_ok_response(status=401)),
+            _context_manager_for(_ok_response(payload=auth_payload)),
+            _context_manager_for(_ok_response(payload=data_payload)),
+        ]
+    )
+    client._token = "stale-token"
+    with patch("asyncio.sleep", new_callable=AsyncMock) as sleep_mock:
+        assert await client._async_query("query { viewer }") == data_payload["data"]
+    assert session.post.call_count == 3
+    sleep_mock.assert_not_awaited()
+
+
+async def test_post_retries_on_kraken_rate_limit_graphql_code() -> None:
+    rate_limited = {
+        "errors": [
+            "ignored",
+            {
+                "message": "Rate limited",
+                "extensions": {"code": "KT-CT-1199"},
+            },
+        ]
+    }
+    ok = {"data": {"viewer": {}}}
+    client, session = _client_with_posts(
+        [
+            _context_manager_for(_ok_response(payload=rate_limited)),
+            _context_manager_for(_ok_response(payload=ok)),
+        ]
+    )
+    with patch("asyncio.sleep", new_callable=AsyncMock) as sleep_mock:
+        assert await client._async_post({"query": "q"}) == ok
+    assert session.post.call_count == 2
+    assert sleep_mock.call_count == 1
+
+
+@pytest.mark.parametrize("code", ["KT-CT-1138", "KT-CT-1124"])
+async def test_post_kraken_auth_codes_raise_auth_error_without_retry(
+    code: str,
+) -> None:
+    payload = {"errors": [{"message": "nope", "extensions": {"code": code}}]}
+    client, session = _client_with_posts(
+        [_context_manager_for(_ok_response(payload=payload))]
+    )
+    with pytest.raises(OctopusAuthError):
+        await client._async_post({"query": "q"})
+    assert session.post.call_count == 1
+
+
+async def test_post_retry_after_invalid_header_uses_backoff() -> None:
+    ok = {"data": {}}
+    client, session = _client_with_posts(
+        [
+            _context_manager_for(
+                _ok_response(status=503, headers={"Retry-After": "not-an-int"})
+            ),
+            _context_manager_for(_ok_response(payload=ok)),
+        ]
+    )
+    with patch("asyncio.sleep", new_callable=AsyncMock) as sleep_mock:
+        assert await client._async_post({"query": "q"}) == ok
+    assert session.post.call_count == 2
+    sleep_mock.assert_awaited_once()
+
+
+async def test_post_retry_after_negative_header_uses_backoff() -> None:
+    ok = {"data": {}}
+    client, session = _client_with_posts(
+        [
+            _context_manager_for(
+                _ok_response(status=503, headers={"Retry-After": "-1"})
+            ),
+            _context_manager_for(_ok_response(payload=ok)),
+        ]
+    )
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        assert await client._async_post({"query": "q"}) == ok
+    assert session.post.call_count == 2
+
+
+async def test_post_retry_after_caps_large_values() -> None:
+    ok = {"data": {}}
+    client, session = _client_with_posts(
+        [
+            _context_manager_for(
+                _ok_response(status=503, headers={"Retry-After": "120"})
+            ),
+            _context_manager_for(_ok_response(payload=ok)),
+        ]
+    )
+    with patch("asyncio.sleep", new_callable=AsyncMock) as sleep_mock:
+        assert await client._async_post({"query": "q"}) == ok
+    delay = sleep_mock.await_args.args[0]
+    assert delay <= 8.0
+
+
+async def test_post_value_error_on_transport_raises_api_error() -> None:
+    client, session = _client_with_posts([ValueError("socket glitch")])
+    with pytest.raises(OctopusApiError, match="Connection error"):
+        await client._async_post({"query": "q"})
+    assert session.post.call_count == 1
 
 
 async def test_query_retries_once_after_401_then_succeeds() -> None:
@@ -496,6 +669,16 @@ async def test_get_contract_without_active_product_keeps_supply_info() -> None:
     assert contract["grid_operator_code"] == "12"
 
 
+async def test_get_contract_skips_malformed_agreement_edges() -> None:
+    payload = _contract_payload()
+    payload["account"]["marketSupplyAgreements"]["edges"].insert(
+        0, {"node": "not-a-dict"}
+    )
+    client = _client_with_query(payload)
+    contract = await client.async_get_contract("A-123")
+    assert contract["plan_name"] == "My Plan"
+
+
 async def test_get_contract_rejects_missing_account() -> None:
     client = _client_with_query({"account": None})
     with pytest.raises(OctopusApiError):
@@ -620,6 +803,11 @@ async def test_get_latest_bill_reraises_auth_error_without_fallback() -> None:
 )
 async def test_get_latest_bill_returns_none_for_empty_malformed(data: dict) -> None:
     client = _client_with_query(data)
+    assert await client.async_get_latest_bill("A-1") is None
+
+
+async def test_get_latest_bill_returns_none_when_parsing_raises() -> None:
+    client = _client_with_query({"account": {"bills": "not-a-bills-object"}})
     assert await client.async_get_latest_bill("A-1") is None
 
 

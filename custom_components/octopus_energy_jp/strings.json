@@ -16,6 +16,14 @@
           "email": "[%key:common::config_flow::data::email%]",
           "password": "[%key:common::config_flow::data::password%]"
         }
+      },
+      "reconfigure": {
+        "title": "Reconfigure",
+        "description": "Update the account email address and password. The account number is fetched again.",
+        "data": {
+          "email": "[%key:common::config_flow::data::email%]",
+          "password": "[%key:common::config_flow::data::password%]"
+        }
       }
     },
     "error": {
@@ -26,7 +34,8 @@
     },
     "abort": {
       "already_configured": "[%key:common::config_flow::abort::already_configured_service%]",
-      "reauth_successful": "[%key:common::config_flow::abort::reauth_successful%]"
+      "reauth_successful": "[%key:common::config_flow::abort::reauth_successful%]",
+      "reconfigure_successful": "Credentials updated. The integration was reloaded."
     }
   },
   "options": {
@@ -55,7 +64,8 @@
       "cost_month": { "name": "Month cost" },
       "prev_month_cost": { "name": "Previous month cost" },
       "billing_kwh": { "name": "Billing period usage" },
-      "billing_cost": { "name": "Billing period cost" }
+      "billing_cost": { "name": "Billing period cost" },
+      "current_rate": { "name": "Current unit rate" }
     }
   }
 }

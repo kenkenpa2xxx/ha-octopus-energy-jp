@@ -37,6 +37,46 @@ def test_statistic_id_for_account() -> None:
     ) != utils.statistic_id_for_account("octopus_energy_jp", "B-2")
 
 
+def test_cost_statistic_id_for_account_uses_slugify() -> None:
+    account = "A-B00C43A0"
+    slug = utils.slugify_account(account)
+    assert (
+        utils.cost_statistic_id_for_account("octopus_energy_jp", account)
+        == f"octopus_energy_jp:{slug}_cost"
+    )
+    assert (
+        utils.cost_statistic_id_for_account("sensor", "  XYZ-123 ")
+        == "sensor:xyz_123_cost"
+    )
+
+
+def test_marginal_rate_kwh_tier_boundaries() -> None:
+    rates = [(0.0, 120.0, 30.0), (120.0, 300.0, 36.0), (300.0, None, 40.0)]
+    # half-open [start, end)
+    assert utils.marginal_rate_kwh(0.0, rates) == 30.0
+    assert utils.marginal_rate_kwh(119.99, rates) == 30.0
+    assert utils.marginal_rate_kwh(120.0, rates) == 36.0
+    assert utils.marginal_rate_kwh(299.99, rates) == 36.0
+    assert utils.marginal_rate_kwh(300.0, rates) == 40.0
+    # open-ended last tier
+    assert utils.marginal_rate_kwh(10_000.0, rates) == 40.0
+
+
+def test_marginal_rate_kwh_empty_and_beyond_last_tier() -> None:
+    assert utils.marginal_rate_kwh(50.0, []) is None
+    finite_only = [(0.0, 100.0, 12.0)]
+    assert utils.marginal_rate_kwh(250.0, finite_only) == 12.0
+
+
+def test_next_tier_rate_kwh() -> None:
+    rates = [(0.0, 120.0, 30.0), (120.0, 300.0, 36.0), (300.0, None, 40.0)]
+    assert utils.next_tier_rate_kwh(50.0, rates) == 36.0
+    assert utils.next_tier_rate_kwh(200.0, rates) == 40.0
+    assert utils.next_tier_rate_kwh(350.0, rates) is None
+    assert utils.next_tier_rate_kwh(10.0, []) is None
+    assert utils.next_tier_rate_kwh(500.0, [(0.0, None, 9.0)]) is None
+
+
 def test_normalize_rates_sorts_and_coerces() -> None:
     raw = [
         {"stepStart": "120", "stepEnd": None, "pricePerUnitIncTax": "35.5"},

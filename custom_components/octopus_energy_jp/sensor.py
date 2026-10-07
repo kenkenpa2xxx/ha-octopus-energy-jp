@@ -152,6 +152,14 @@ SENSORS: tuple[OctopusSensorDescription, ...] = (
         suggested_display_precision=0,
         value_fn=lambda d: (d.get("billing") or {}).get("total"),
     ),
+    OctopusSensorDescription(
+        key="current_rate",
+        translation_key="current_rate",
+        native_unit_of_measurement="JPY/kWh",
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=2,
+        value_fn=lambda d: d.get("current_rate_kwh"),
+    ),
 )
 
 
@@ -224,10 +232,22 @@ class OctopusSensor(CoordinatorEntity[OctopusEnergyJpCoordinator], SensorEntity)
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
         """集約ペイロードを yesterday_kwh センサーに付与する。"""
-        if (
-            self.entity_description.key != "yesterday_kwh"
-            or self.coordinator.data is None
-        ):
+        if self.coordinator.data is None:
+            return None
+        key = self.entity_description.key
+        if key == "current_rate":
+            d = self.coordinator.data
+            if d.get("current_rate_kwh") is None:
+                return None
+            return {
+                "tier_rate": d.get("current_rate_tier_kwh"),
+                "fuel_adjustment_per_kwh": d.get("current_rate_fuel_per_kwh"),
+                "renewable_levy_per_kwh": d.get("current_rate_levy_per_kwh"),
+                "next_tier_rate": d.get("current_rate_next_tier_kwh"),
+                "plan_name": d.get("plan_name"),
+                "month_kwh": d.get("current_rate_month_kwh"),
+            }
+        if key != "yesterday_kwh":
             return None
         d = self.coordinator.data
         daily = d.get("daily") or []

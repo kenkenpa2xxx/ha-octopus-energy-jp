@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import re
 from datetime import datetime
 from typing import Any
@@ -14,6 +15,29 @@ from .const import API_URL
 from .utils import RateTier, normalize_rates, select_latest_bill
 
 _LOGGER = logging.getLogger(__name__)
+
+# Kraken GraphQL extension codes (transport / auth semantics).
+KT_CT_RATE_LIMITED = "KT-CT-1199"
+KT_CT_TOKEN_EXPIRED = "KT-CT-1124"
+KT_CT_INVALID_CREDENTIALS = "KT-CT-1138"
+
+RETRY_MAX_ATTEMPTS = 3
+RETRY_BASE_DELAY = 1.0
+RETRY_BACKOFF_FACTOR = 2.0
+RETRY_MAX_DELAY = 8.0
+RETRY_AFTER_MAX = 8.0
+
+_TRANSIENT_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
+
+
+class _RetryableRequestError(Exception):
+    """Internal signal for transient failures eligible for bounded retry."""
+
+    def __init__(self, reason: str, retry_after: float | None = None) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.retry_after = retry_after
+
 
 # 認証切れを示す具体的な語のみ。bare "auth" は "author" 等に誤マッチするため除外。
 # GraphQL errors の message 判定は小文字化＋単語境界ベースで行う。
@@ -60,6 +84,61 @@ def _has_auth_error_code(errors: Any) -> bool:
         if isinstance(code, str) and code.upper() in _AUTH_ERROR_CODES:
             return True
     return False
+
+
+def _kraken_extension_codes(errors: Any) -> list[str]:
+    """Return Kraken ``extensions.code`` values from a GraphQL errors payload."""
+    codes: list[str] = []
+    items = errors if isinstance(errors, (list, tuple)) else [errors]
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        extensions = item.get("extensions")
+        if not isinstance(extensions, dict):
+            continue
+        code = extensions.get("code")
+        if isinstance(code, str):
+            codes.append(code)
+    return codes
+
+
+def _parse_retry_after_seconds(resp: aiohttp.ClientResponse) -> float | None:
+    """Parse integer ``Retry-After`` header seconds, capped."""
+    raw = resp.headers.get("Retry-After")
+    if raw is None:
+        return None
+    try:
+        seconds = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if seconds < 0:
+        return None
+    return float(min(seconds, RETRY_AFTER_MAX))
+
+
+def _compute_retry_delay(attempt: int, retry_after: float | None) -> float:
+    """Exponential backoff with jitter; honour ``Retry-After`` when provided."""
+    if retry_after is not None:
+        base = min(retry_after, RETRY_MAX_DELAY)
+    else:
+        base = min(
+            RETRY_BASE_DELAY * (RETRY_BACKOFF_FACTOR ** (attempt - 1)),
+            RETRY_MAX_DELAY,
+        )
+    return base * (0.5 + random.random() * 0.5)
+
+
+def _raise_for_graphql_errors(errors: Any) -> None:
+    """Map GraphQL errors to auth, retryable, or generic API failures."""
+    codes = _kraken_extension_codes(errors)
+    if KT_CT_INVALID_CREDENTIALS in codes or KT_CT_TOKEN_EXPIRED in codes:
+        raise OctopusAuthError(str(errors))
+    if KT_CT_RATE_LIMITED in codes:
+        raise _RetryableRequestError(str(errors))
+    message = str(errors)
+    if _is_auth_error(message) or _has_auth_error_code(errors):
+        raise OctopusAuthError(message)
+    raise OctopusApiError(message)
 
 
 AUTH_MUTATION = """
@@ -194,6 +273,28 @@ class OctopusEnergyJpApiClient:
     async def _async_post(
         self, body: dict[str, Any], authenticated: bool = True
     ) -> dict[str, Any]:
+        last_retryable: _RetryableRequestError | None = None
+        for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
+            try:
+                return await self._async_post_once(body, authenticated=authenticated)
+            except _RetryableRequestError as err:
+                last_retryable = err
+                if attempt >= RETRY_MAX_ATTEMPTS:
+                    break
+                _LOGGER.warning(
+                    "Retrying API request (attempt %s/%s): %s",
+                    attempt,
+                    RETRY_MAX_ATTEMPTS,
+                    err.reason,
+                )
+                await asyncio.sleep(_compute_retry_delay(attempt, err.retry_after))
+        if last_retryable is not None:
+            raise OctopusApiError(last_retryable.reason) from last_retryable
+        raise OctopusApiError("Request failed after retries")
+
+    async def _async_post_once(
+        self, body: dict[str, Any], authenticated: bool = True
+    ) -> dict[str, Any]:
         headers = {"Content-Type": "application/json"}
         if authenticated and self._token:
             headers["Authorization"] = f"JWT {self._token}"
@@ -206,6 +307,11 @@ class OctopusEnergyJpApiClient:
             ) as resp:
                 if resp.status in (401, 403):
                     raise OctopusAuthError(f"HTTP {resp.status}")
+                if resp.status in _TRANSIENT_HTTP_STATUSES:
+                    raise _RetryableRequestError(
+                        f"HTTP {resp.status}",
+                        retry_after=_parse_retry_after_seconds(resp),
+                    )
                 if resp.status != 200:
                     raise OctopusApiError(f"HTTP {resp.status}")
                 try:
@@ -216,11 +322,19 @@ class OctopusEnergyJpApiClient:
                     ) from err
         except OctopusApiError:
             raise
+        except OctopusAuthError:
+            raise
+        except _RetryableRequestError:
+            raise
         except asyncio.CancelledError:
             raise
         except KeyError:
             raise
-        except (TimeoutError, aiohttp.ClientError, ValueError) as err:
+        except TimeoutError as err:
+            raise _RetryableRequestError(f"Connection error: {err}") from err
+        except aiohttp.ClientError as err:
+            raise _RetryableRequestError(f"Connection error: {err}") from err
+        except ValueError as err:
             raise OctopusApiError(f"Connection error: {err}") from err
         except Exception as err:
             raise OctopusApiError(f"Unexpected API error: {err}") from err
@@ -228,10 +342,7 @@ class OctopusEnergyJpApiClient:
             raise OctopusApiError("Unexpected API response structure")
         errors = payload.get("errors")
         if errors:
-            message = str(errors)
-            if _is_auth_error(message) or _has_auth_error_code(errors):
-                raise OctopusAuthError(message)
-            raise OctopusApiError(message)
+            _raise_for_graphql_errors(errors)
         return payload
 
     async def _async_query(

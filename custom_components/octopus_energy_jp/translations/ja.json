@@ -16,6 +16,14 @@
           "email": "メールアドレス",
           "password": "パスワード"
         }
+      },
+      "reconfigure": {
+        "title": "再設定",
+        "description": "アカウントのメールアドレスとパスワードを更新します。口座番号は再取得します。",
+        "data": {
+          "email": "メールアドレス",
+          "password": "パスワード"
+        }
       }
     },
     "error": {
@@ -26,7 +34,8 @@
     },
     "abort": {
       "already_configured": "このサービスはすでに設定されています",
-      "reauth_successful": "再認証に成功しました"
+      "reauth_successful": "再認証に成功しました",
+      "reconfigure_successful": "認証情報を更新し、統合を再読み込みしました。"
     }
   },
   "options": {
@@ -55,7 +64,8 @@
       "cost_month": { "name": "当月の料金" },
       "prev_month_cost": { "name": "前月の料金" },
       "billing_kwh": { "name": "請求期間使用量" },
-      "billing_cost": { "name": "請求期間料金" }
+      "billing_cost": { "name": "請求期間料金" },
+      "current_rate": { "name": "現在の単価" }
     }
   }
 }

@@ -90,6 +90,28 @@ class OctopusEnergyJpConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             step_id="user", data_schema=DATA_SCHEMA, errors=errors
         )
 
+    async def _async_try_update_credentials(
+        self,
+        entry: config_entries.ConfigEntry,
+        user_input: dict[str, Any],
+    ) -> tuple[dict[str, str], config_entries.ConfigFlowResult | None]:
+        """Validate credentials and update the entry when the account matches."""
+        errors, account = await self._async_validate(
+            user_input[CONF_EMAIL], user_input[CONF_PASSWORD]
+        )
+        if errors:
+            return errors, None
+        if account == entry.unique_id:
+            return {}, self.async_update_reload_and_abort(
+                entry,
+                data={
+                    CONF_EMAIL: user_input[CONF_EMAIL],
+                    CONF_PASSWORD: user_input[CONF_PASSWORD],
+                    CONF_ACCOUNT_NUMBER: account,
+                },
+            )
+        return {"base": "account_mismatch"}, None
+
     async def async_step_reauth(
         self, entry_data: dict[str, Any]
     ) -> config_entries.ConfigFlowResult:
@@ -103,22 +125,25 @@ class OctopusEnergyJpConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         entry = self._get_reauth_entry()
         errors: dict[str, str] = {}
         if user_input is not None:
-            errors, account = await self._async_validate(
-                user_input[CONF_EMAIL], user_input[CONF_PASSWORD]
-            )
-            if account is not None and account == entry.unique_id:
-                return self.async_update_reload_and_abort(
-                    entry,
-                    data={
-                        CONF_EMAIL: user_input[CONF_EMAIL],
-                        CONF_PASSWORD: user_input[CONF_PASSWORD],
-                        CONF_ACCOUNT_NUMBER: account,
-                    },
-                )
-            if account is not None:
-                errors["base"] = "account_mismatch"
+            errors, result = await self._async_try_update_credentials(entry, user_input)
+            if result is not None:
+                return result
         return self.async_show_form(
             step_id="reauth_confirm", data_schema=DATA_SCHEMA, errors=errors
+        )
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.ConfigFlowResult:
+        """Reconfigure credentials for an existing entry."""
+        entry = self._get_reconfigure_entry()
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            errors, result = await self._async_try_update_credentials(entry, user_input)
+            if result is not None:
+                return result
+        return self.async_show_form(
+            step_id="reconfigure", data_schema=DATA_SCHEMA, errors=errors
         )
 
 

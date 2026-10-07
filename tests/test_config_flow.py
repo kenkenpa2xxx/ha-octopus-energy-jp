@@ -139,6 +139,113 @@ async def test_reauth_flow_updates_entry(hass):
     assert entry.data[CONF_EMAIL] == "new@example.com"
 
 
+async def test_reconfigure_flow_updates_entry(hass):
+    """Reconfigure with the same account updates credentials and reloads."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id=ACCOUNT, data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+
+    with patch(
+        "custom_components.octopus_energy_jp.config_flow.OctopusEnergyJpApiClient",
+        _patched_client(account=ACCOUNT),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={
+                "source": config_entries.SOURCE_RECONFIGURE,
+                "entry_id": entry.entry_id,
+            },
+        )
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == "reconfigure"
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {CONF_EMAIL: "new@example.com", CONF_PASSWORD: "newpw"}
+        )
+        await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert entry.data[CONF_EMAIL] == "new@example.com"
+    assert entry.data[CONF_PASSWORD] == "newpw"
+
+
+async def test_reconfigure_flow_invalid_auth(hass):
+    """Reconfigure surfaces invalid_auth without changing the entry."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id=ACCOUNT, data=dict(ENTRY_DATA))
+    entry.add_to_hass(hass)
+    original = dict(entry.data)
+
+    with patch(
+        "custom_components.octopus_energy_jp.config_flow.OctopusEnergyJpApiClient",
+        _patched_client(error=OctopusAuthError("nope")),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={
+                "source": config_entries.SOURCE_RECONFIGURE,
+                "entry_id": entry.entry_id,
+            },
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], CREDENTIALS
+        )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "invalid_auth"}
+    assert entry.data == original
+
+
+async def test_reconfigure_flow_cannot_connect(hass):
+    """Reconfigure surfaces cannot_connect without changing the entry."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id=ACCOUNT, data=dict(ENTRY_DATA))
+    entry.add_to_hass(hass)
+    original = dict(entry.data)
+
+    with patch(
+        "custom_components.octopus_energy_jp.config_flow.OctopusEnergyJpApiClient",
+        _patched_client(error=OctopusApiError("boom")),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={
+                "source": config_entries.SOURCE_RECONFIGURE,
+                "entry_id": entry.entry_id,
+            },
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], CREDENTIALS
+        )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "cannot_connect"}
+    assert entry.data == original
+
+
+async def test_reconfigure_flow_account_mismatch(hass):
+    """Different account during reconfigure is rejected without touching the entry."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id=ACCOUNT, data=dict(ENTRY_DATA))
+    entry.add_to_hass(hass)
+    original = dict(entry.data)
+
+    with patch(
+        "custom_components.octopus_energy_jp.config_flow.OctopusEnergyJpApiClient",
+        _patched_client(account="A-OTHER999"),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={
+                "source": config_entries.SOURCE_RECONFIGURE,
+                "entry_id": entry.entry_id,
+            },
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], CREDENTIALS
+        )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "account_mismatch"}
+    assert entry.data == original
+
+
 async def test_reauth_flow_account_mismatch(hass):
     """Different account during re-auth is rejected without touching the entry."""
     entry = MockConfigEntry(domain=DOMAIN, unique_id=ACCOUNT, data=ENTRY_DATA)

@@ -2,16 +2,30 @@
 
 from __future__ import annotations
 
+import logging
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from freezegun import freeze_time
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.storage import Store
+from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.octopus_energy_jp import (
+    async_remove_entry,
+    async_unload_entry,
+)
+from custom_components.octopus_energy_jp.__init__ import (
+    _get_hourly,
+    _hourly_signature,
+)
 from custom_components.octopus_energy_jp.const import CONF_ACCOUNT_NUMBER, DOMAIN
 from custom_components.octopus_energy_jp.coordinator import OctopusEnergyJpCoordinator
 from custom_components.octopus_energy_jp.sensor import SENSORS
+from custom_components.octopus_energy_jp.statistics import OctopusStatisticsImporter
 
 ACCOUNT = "A-TEST1234"
 ENTRY_DATA = {
@@ -39,6 +53,47 @@ def _offline_fetch_patch():
     )
 
 
+def _fetch_patch(payload: dict):
+    return patch.object(
+        OctopusEnergyJpCoordinator,
+        "_async_update_data",
+        AsyncMock(return_value=payload),
+    )
+
+
+def _jst_hour(day: int, hour: int) -> datetime:
+    tz = dt_util.get_time_zone("Asia/Tokyo")
+    assert tz is not None
+    return datetime(2026, 7, day, hour, 0, tzinfo=tz)
+
+
+def _settled_hourly_payload() -> dict:
+    """Coordinator payload with one settled hour (frozen clock in tests)."""
+    start = _jst_hour(14, 0)
+    return {
+        "hourly": [
+            {"start": start, "kwh": 0.5, "cost": 12.5},
+            {"start": start + timedelta(hours=1), "kwh": 0.6, "cost": 15.0},
+        ]
+    }
+
+
+def test_get_hourly_and_signature_helpers() -> None:
+    assert _get_hourly(None) is None
+    assert _get_hourly({}) is None
+    assert _get_hourly({"hourly": []}) is None
+    hourly = [{"start": "2026-07-14T01:00:00+09:00", "kwh": 1.0}]
+    assert _get_hourly({"hourly": hourly}) == hourly
+    assert _hourly_signature(hourly) == (1, "2026-07-14T01:00:00+09:00")
+    assert _hourly_signature([{"start": 42}]) == (1, "42")
+
+    class _Row:
+        start = "object-start"
+
+    assert _hourly_signature([_Row()]) == (1, "object-start")
+    assert _hourly_signature(["bad"]) == (1, "bad")
+
+
 async def test_setup_creates_all_sensors_and_unloads(hass):
     """Setup registers every sensor description and unload tears them down."""
     entry = _new_entry()
@@ -55,6 +110,149 @@ async def test_setup_creates_all_sensors_and_unloads(hass):
         await hass.async_block_till_done()
 
     assert entry.state is ConfigEntryState.NOT_LOADED
+
+
+async def test_setup_creates_both_importers_and_imports_at_setup(hass):
+    """Setup wires consumption and cost importers and imports settled hourly once."""
+    entry = _new_entry()
+    entry.add_to_hass(hass)
+    payload = _settled_hourly_payload()
+    tz = dt_util.get_time_zone("Asia/Tokyo")
+    assert tz is not None
+    previous = dt_util.DEFAULT_TIME_ZONE
+    dt_util.set_default_time_zone(tz)
+    try:
+        with (
+            _api_client_patch(),
+            _fetch_patch(payload),
+            freeze_time("2026-07-15 03:00:00"),
+            patch(
+                "custom_components.octopus_energy_jp.statistics.async_add_external_statistics"
+            ) as mock_add,
+        ):
+            assert await hass.config_entries.async_setup(entry.entry_id)
+            await hass.async_block_till_done()
+    finally:
+        dt_util.set_default_time_zone(previous)
+
+    runtime = entry.runtime_data
+    assert isinstance(runtime["importer"], OctopusStatisticsImporter)
+    assert isinstance(runtime["cost_importer"], OctopusStatisticsImporter)
+    assert mock_add.call_count == 2
+    statistic_ids = {call.args[1]["statistic_id"] for call in mock_add.call_args_list}
+    assert len(statistic_ids) == 2
+
+
+async def test_coordinator_update_imports_both_and_skips_unchanged_signature(hass):
+    entry = _new_entry()
+    entry.add_to_hass(hass)
+    payload = _settled_hourly_payload()
+    tz = dt_util.get_time_zone("Asia/Tokyo")
+    assert tz is not None
+    previous = dt_util.DEFAULT_TIME_ZONE
+    dt_util.set_default_time_zone(tz)
+    try:
+        with (
+            _api_client_patch(),
+            _fetch_patch(payload),
+            freeze_time("2026-07-15 03:00:00"),
+            patch(
+                "custom_components.octopus_energy_jp.statistics.async_add_external_statistics"
+            ) as mock_add,
+        ):
+            assert await hass.config_entries.async_setup(entry.entry_id)
+            await hass.async_block_till_done()
+            assert mock_add.call_count == 2
+
+            coordinator = entry.runtime_data["coordinator"]
+            coordinator.data = payload
+            coordinator.async_update_listeners()
+            await hass.async_block_till_done()
+            assert mock_add.call_count == 2
+
+            extended = {
+                "hourly": payload["hourly"]
+                + [
+                    {
+                        "start": payload["hourly"][-1]["start"] + timedelta(hours=1),
+                        "kwh": 0.7,
+                        "cost": 20.0,
+                    }
+                ]
+            }
+            coordinator.data = extended
+            coordinator.async_update_listeners()
+            await hass.async_block_till_done()
+            assert mock_add.call_count == 4
+    finally:
+        dt_util.set_default_time_zone(previous)
+
+
+async def test_coordinator_update_returns_early_when_hourly_missing(hass):
+    entry = _new_entry()
+    entry.add_to_hass(hass)
+    with (
+        _api_client_patch(),
+        _offline_fetch_patch(),
+        patch(
+            "custom_components.octopus_energy_jp.statistics.async_add_external_statistics"
+        ) as mock_add,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        assert mock_add.call_count == 0
+
+        coordinator = entry.runtime_data["coordinator"]
+        coordinator.data = {"daily": []}
+        coordinator.async_update_listeners()
+        await hass.async_block_till_done()
+        assert mock_add.call_count == 0
+
+
+async def test_statistics_import_failure_is_logged(hass, caplog):
+    entry = _new_entry()
+    entry.add_to_hass(hass)
+    payload = _settled_hourly_payload()
+    tz = dt_util.get_time_zone("Asia/Tokyo")
+    assert tz is not None
+    previous = dt_util.DEFAULT_TIME_ZONE
+    dt_util.set_default_time_zone(tz)
+    caplog.set_level(logging.ERROR)
+    try:
+        with (
+            _api_client_patch(),
+            _fetch_patch(payload),
+            freeze_time("2026-07-15 03:00:00"),
+            patch(
+                "custom_components.octopus_energy_jp.statistics.async_add_external_statistics"
+            ),
+        ):
+            assert await hass.config_entries.async_setup(entry.entry_id)
+            await hass.async_block_till_done()
+
+            importer = entry.runtime_data["importer"]
+            importer.async_import = AsyncMock(side_effect=RuntimeError("import boom"))
+
+            coordinator = entry.runtime_data["coordinator"]
+            coordinator.data = {
+                "hourly": payload["hourly"]
+                + [
+                    {
+                        "start": payload["hourly"][-1]["start"] + timedelta(hours=2),
+                        "kwh": 1.0,
+                        "cost": 1.0,
+                    }
+                ]
+            }
+            coordinator.async_update_listeners()
+            await hass.async_block_till_done()
+    finally:
+        dt_util.set_default_time_zone(previous)
+
+    assert any(
+        "統計のインポートに失敗しました" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 async def test_legacy_usage_registry_entry_is_removed(hass):
@@ -81,6 +279,44 @@ async def test_legacy_usage_registry_entry_is_removed(hass):
         await hass.async_block_till_done()
 
 
+async def test_legacy_usage_registry_cleanup_failure_does_not_break_setup(hass):
+    registry = er.async_get(hass)
+    registry.async_get_or_create("sensor", DOMAIN, f"{ACCOUNT}_usage")
+    entry = _new_entry()
+    entry.add_to_hass(hass)
+
+    with (
+        _api_client_patch(),
+        _offline_fetch_patch(),
+        patch.object(
+            er.EntityRegistry,
+            "async_remove",
+            side_effect=RuntimeError("registry locked"),
+        ),
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert entry.state is ConfigEntryState.LOADED
+
+
+async def test_async_unload_entry_returns_platform_result(hass):
+    entry = _new_entry()
+    entry.add_to_hass(hass)
+    with _api_client_patch(), _offline_fetch_patch():
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    with patch.object(
+        hass.config_entries,
+        "async_unload_platforms",
+        AsyncMock(return_value=True),
+    ) as mock_unload:
+        result = await async_unload_entry(hass, entry)
+    assert result is True
+    mock_unload.assert_awaited_once()
+
+
 async def test_remove_entry_completes(hass):
     """Deleting the entry runs its cleanup without raising."""
     entry = _new_entry()
@@ -95,3 +331,26 @@ async def test_remove_entry_completes(hass):
         await hass.async_block_till_done()
 
     assert hass.config_entries.async_get_entry(entry.entry_id) is None
+
+
+async def test_async_remove_entry_removes_all_stores_and_tolerates_failures(hass):
+    entry = _new_entry()
+    entry.add_to_hass(hass)
+    removed: list[str] = []
+
+    async def tracked_remove(self: Store) -> None:
+        removed.append(self.key)
+        if self.key.endswith("_statistics") and not self.key.endswith(
+            "_statistics_cost"
+        ):
+            raise OSError("statistics store stuck")
+
+    with patch.object(Store, "async_remove", tracked_remove):
+        await async_remove_entry(hass, entry)
+
+    expected = {
+        f"{DOMAIN}_{entry.entry_id}_daily",
+        f"{DOMAIN}_{entry.entry_id}_statistics",
+        f"{DOMAIN}_{entry.entry_id}_statistics_cost",
+    }
+    assert set(removed) == expected

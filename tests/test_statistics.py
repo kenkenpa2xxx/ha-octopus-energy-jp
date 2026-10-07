@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from freezegun import freeze_time
+from homeassistant.components.recorder.models import StatisticMeanType
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 
@@ -24,10 +25,14 @@ from custom_components.octopus_energy_jp.const import (
     STATS_IMPORT_BUFFER,
 )
 from custom_components.octopus_energy_jp.statistics import OctopusStatisticsImporter
-from custom_components.octopus_energy_jp.utils import statistic_id_for_account
+from custom_components.octopus_energy_jp.utils import (
+    cost_statistic_id_for_account,
+    statistic_id_for_account,
+)
 
 ACCOUNT = "A-TEST1234"
 STATISTIC_ID = statistic_id_for_account(DOMAIN, ACCOUNT)
+COST_STATISTIC_ID = cost_statistic_id_for_account(DOMAIN, ACCOUNT)
 
 
 @contextmanager
@@ -67,6 +72,21 @@ def _new_importer(
     return OctopusStatisticsImporter(hass, entry_id, ACCOUNT)
 
 
+def _new_cost_importer(
+    hass: HomeAssistant, entry_id: str = "stats-cost-1"
+) -> OctopusStatisticsImporter:
+    return OctopusStatisticsImporter(hass, entry_id, ACCOUNT, series="cost")
+
+
+def _hourly_with_cost(
+    start: datetime, pairs: list[tuple[float, float]]
+) -> list[dict[str, Any]]:
+    return [
+        {"start": start + timedelta(hours=i), "kwh": kwh, "cost": cost}
+        for i, (kwh, cost) in enumerate(pairs)
+    ]
+
+
 def _recorder_patches(rows: Any):
     """Patch get_instance/get_last_statistics so recovery returns ``rows``."""
     instance = MagicMock()
@@ -81,8 +101,8 @@ def _recorder_patches(rows: Any):
     )
 
 
-def _dict_rows(start_ms: float, total: Any) -> dict[str, Any]:
-    return {STATISTIC_ID: [{"start": start_ms, "sum": total, "state": total}]}
+def _dict_rows(statistic_id: str, start_ms: float, total: Any) -> dict[str, Any]:
+    return {statistic_id: [{"start": start_ms, "sum": total, "state": total}]}
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +116,7 @@ async def test_recover_baseline_dict_shape_seeds_state_and_warns(
     importer = _new_importer(hass)
     start_local = _jst(14, 2)
     get_patch, fn_patch, instance = _recorder_patches(
-        _dict_rows(_epoch_ms(start_local), 12.5)
+        _dict_rows(STATISTIC_ID, _epoch_ms(start_local), 12.5)
     )
     with _frozen_jst(), get_patch, fn_patch, caplog.at_level(logging.WARNING):
         await importer._recover_baseline_from_recorder()
@@ -136,7 +156,7 @@ async def test_recover_baseline_bad_sum_coerced_to_zero(
     importer = _new_importer(hass)
     start_local = _jst(14, 2)
     get_patch, fn_patch, _ = _recorder_patches(
-        _dict_rows(_epoch_ms(start_local), raw_sum)
+        _dict_rows(STATISTIC_ID, _epoch_ms(start_local), raw_sum)
     )
     with _frozen_jst(), get_patch, fn_patch:
         await importer._recover_baseline_from_recorder()
@@ -150,7 +170,7 @@ async def test_recover_baseline_unusable_start_leaves_fresh(
     hass: HomeAssistant, raw_start: Any
 ) -> None:
     importer = _new_importer(hass)
-    get_patch, fn_patch, _ = _recorder_patches(_dict_rows(raw_start, 9.0))
+    get_patch, fn_patch, _ = _recorder_patches(_dict_rows(STATISTIC_ID, raw_start, 9.0))
     with _frozen_jst(), get_patch, fn_patch:
         await importer._recover_baseline_from_recorder()
     assert importer._last_start is None
@@ -162,7 +182,7 @@ async def test_recover_baseline_huge_start_leaves_fresh(
     hass: HomeAssistant,
 ) -> None:
     importer = _new_importer(hass)
-    get_patch, fn_patch, _ = _recorder_patches(_dict_rows(1e20, 9.0))
+    get_patch, fn_patch, _ = _recorder_patches(_dict_rows(STATISTIC_ID, 1e20, 9.0))
     with _frozen_jst(), get_patch, fn_patch:
         await importer._recover_baseline_from_recorder()
     assert importer._last_start is None
@@ -609,7 +629,7 @@ async def test_recovered_baseline_end_to_end_continues_cumulative(
     importer = _new_importer(hass, "import-recovered")
     recovered_start = _jst(14, 2)
     get_patch, fn_patch, _ = _recorder_patches(
-        _dict_rows(_epoch_ms(recovered_start), 10.0)
+        _dict_rows(STATISTIC_ID, _epoch_ms(recovered_start), 10.0)
     )
     with _frozen_jst(), get_patch, fn_patch:
         await importer._recover_baseline_from_recorder()
@@ -634,3 +654,139 @@ async def test_recovered_baseline_end_to_end_continues_cumulative(
     assert points[2]["sum"] == pytest.approx(12.7)
     assert importer._cumulative == pytest.approx(12.7)
     assert importer._last_start == _jst(14, 5)
+
+
+# ---------------------------------------------------------------------------
+# Cost series (series="cost")
+# ---------------------------------------------------------------------------
+
+
+async def test_cost_series_metadata_and_rows_state_and_monotonic_sum(
+    hass: HomeAssistant,
+) -> None:
+    importer = _new_cost_importer(hass, "cost-meta")
+    hourly = _hourly_with_cost(_jst(14, 0), [(0.4, 10.5), (0.6, 20.25), (0.1, 5.0)])
+    with (
+        _frozen_jst(),
+        patch(
+            "custom_components.octopus_energy_jp.statistics.async_add_external_statistics"
+        ) as mock_add,
+    ):
+        await importer.async_import(hourly)
+    assert mock_add.call_count == 1
+    metadata = mock_add.call_args[0][1]
+    points = mock_add.call_args[0][2]
+    assert metadata["statistic_id"] == COST_STATISTIC_ID
+    assert metadata["name"] == f"Octopus Energy Japan cost ({ACCOUNT})"
+    assert metadata["source"] == DOMAIN
+    assert metadata["has_sum"] is True
+    assert metadata["mean_type"] == StatisticMeanType.NONE
+    assert metadata["unit_class"] is None
+    assert metadata["unit_of_measurement"] is None
+    running = 0.0
+    for point, item in zip(points, hourly, strict=True):
+        cost = item["cost"]
+        running += cost
+        assert point["state"] == pytest.approx(round(cost, 3))
+        assert point["sum"] == pytest.approx(round(running, 3))
+        assert point["sum"] >= (points[0]["sum"] if point is points[0] else 0)
+
+
+async def test_consumption_import_rows_never_include_state_key(
+    hass: HomeAssistant,
+) -> None:
+    importer = _new_importer(hass, "cons-no-state")
+    hourly = _hourly(_jst(14, 0), [0.5, 0.6, 0.7])
+    with (
+        _frozen_jst(),
+        patch(
+            "custom_components.octopus_energy_jp.statistics.async_add_external_statistics"
+        ) as mock_add,
+    ):
+        await importer.async_import(hourly)
+    points = mock_add.call_args[0][2]
+    for point in points:
+        assert "state" not in point
+
+
+async def test_consumption_and_cost_importers_independent_state_and_stores(
+    hass: HomeAssistant,
+) -> None:
+    entry_id = "indep-series"
+    consumption = _new_importer(hass, entry_id)
+    cost = _new_cost_importer(hass, entry_id)
+    t0, t1, t2 = _jst(14, 0), _jst(14, 1), _jst(14, 2)
+    hourly = [
+        {"start": t0, "kwh": 1.0, "cost": 100.0},
+        {"start": t1, "kwh": 2.0, "cost": 200.0},
+        {"start": t2, "kwh": 3.0},
+    ]
+    with (
+        _frozen_jst(),
+        patch(
+            "custom_components.octopus_energy_jp.statistics.async_add_external_statistics"
+        ),
+    ):
+        await consumption.async_import(hourly)
+        await cost.async_import(hourly)
+    assert consumption._last_start == t2
+    assert cost._last_start == t1
+    assert consumption._cumulative == pytest.approx(6.0)
+    assert cost._cumulative == pytest.approx(300.0)
+    cons_store = await consumption._store.async_load()
+    cost_store = await cost._store.async_load()
+    assert cons_store is not None and cost_store is not None
+    assert cons_store["cumulative"] == pytest.approx(6.0)
+    assert cost_store["cumulative"] == pytest.approx(300.0)
+    assert cons_store != cost_store
+
+    reloaded_cons = OctopusStatisticsImporter(hass, entry_id, ACCOUNT)
+    reloaded_cost = OctopusStatisticsImporter(hass, entry_id, ACCOUNT, series="cost")
+    await reloaded_cons.async_load()
+    await reloaded_cost.async_load()
+    assert reloaded_cons._cumulative == pytest.approx(6.0)
+    assert reloaded_cost._cumulative == pytest.approx(300.0)
+
+
+async def test_cost_recover_baseline_queries_cost_statistic_id(
+    hass: HomeAssistant,
+) -> None:
+    importer = _new_cost_importer(hass)
+    start_local = _jst(14, 2)
+    get_patch, fn_patch, instance = _recorder_patches(
+        _dict_rows(COST_STATISTIC_ID, _epoch_ms(start_local), 99.0)
+    )
+    with _frozen_jst(), get_patch, fn_patch:
+        await importer._recover_baseline_from_recorder()
+    assert importer._cumulative == pytest.approx(99.0)
+    executor_args = instance.async_add_executor_job.call_args[0]
+    assert executor_args[3] == COST_STATISTIC_ID
+
+
+async def test_cost_async_import_skips_missing_and_invalid_cost(
+    hass: HomeAssistant,
+) -> None:
+    importer = _new_cost_importer(hass, "cost-skip")
+    with _frozen_jst() as now:
+        settled = _jst(14, 0)
+        fresh = dt_util.as_local(
+            (now - STATS_IMPORT_BUFFER + timedelta(hours=1)).replace(
+                minute=0, second=0, microsecond=0
+            )
+        )
+        hourly: list[Any] = [
+            {"start": settled, "kwh": 1.0, "cost": 10.0},
+            {"start": settled + timedelta(hours=1), "kwh": 2.0},
+            {"start": settled + timedelta(hours=2), "kwh": 3.0, "cost": float("inf")},
+            {"start": settled + timedelta(hours=3), "kwh": 4.0, "cost": "junk"},
+            {"start": fresh, "kwh": 5.0, "cost": 50.0},
+        ]
+        with patch(
+            "custom_components.octopus_energy_jp.statistics.async_add_external_statistics"
+        ) as mock_add:
+            await importer.async_import(hourly)
+    assert mock_add.call_count == 1
+    points = mock_add.call_args[0][2]
+    assert len(points) == 1
+    assert points[0]["state"] == pytest.approx(10.0)
+    assert points[0]["sum"] == pytest.approx(10.0)

@@ -69,6 +69,12 @@ def _payload():
         "last_update": now.isoformat(),
         "today_start": today_start.isoformat(),
         "month_start": month_start.isoformat(),
+        "current_rate_kwh": 35.42,
+        "current_rate_tier_kwh": 30.0,
+        "current_rate_fuel_per_kwh": 3.5,
+        "current_rate_levy_per_kwh": 1.92,
+        "current_rate_next_tier_kwh": 34.0,
+        "current_rate_month_kwh": 120.4,
     }
 
 
@@ -211,6 +217,111 @@ async def test_diff_sensors_registered_as_diagnostic(hass):
         reg_entry = registry.async_get(entity_id)
         assert reg_entry is not None
         assert reg_entry.entity_category == "diagnostic"
+
+
+def test_current_rate_sensor_description():
+    """Current unit rate is a user-facing MEASUREMENT without device_class."""
+    description = _by_key()["current_rate"]
+    assert description.native_unit_of_measurement == "JPY/kWh"
+    assert description.state_class == SensorStateClass.MEASUREMENT
+    assert description.suggested_display_precision == 2
+    assert description.device_class is None
+    assert description.entity_category is None
+
+
+async def test_current_rate_sensor_state_and_attributes(hass):
+    """Current rate exposes tier breakdown attributes without series payloads."""
+    payload = _payload()
+    await _setup_with_payload(hass, payload)
+
+    registry = er.async_get(hass)
+    entity_id = registry.async_get_entity_id(
+        "sensor", DOMAIN, f"{ACCOUNT}_current_rate"
+    )
+    assert entity_id is not None
+
+    state = hass.states.get(entity_id)
+    assert state is not None
+    assert state.state == str(payload["current_rate_kwh"])
+    assert state.attributes.get("unit_of_measurement") == "JPY/kWh"
+    assert state.attributes.get("state_class") == "measurement"
+    assert "device_class" not in state.attributes
+
+    attrs = state.attributes
+    assert attrs["tier_rate"] == payload["current_rate_tier_kwh"]
+    assert attrs["fuel_adjustment_per_kwh"] == payload["current_rate_fuel_per_kwh"]
+    assert attrs["renewable_levy_per_kwh"] == payload["current_rate_levy_per_kwh"]
+    assert attrs["next_tier_rate"] == payload["current_rate_next_tier_kwh"]
+    assert attrs["plan_name"] == payload["plan_name"]
+    assert attrs["month_kwh"] == payload["current_rate_month_kwh"]
+    for forbidden in ("daily", "hourly", "yesterday_series", "today_series"):
+        assert forbidden not in attrs
+
+
+async def test_current_rate_unknown_when_coordinator_lacks_rate(hass):
+    """Missing rate data yields unknown state and no attributes, never zero."""
+    payload = _payload()
+    payload["current_rate_kwh"] = None
+    await _setup_with_payload(hass, payload)
+
+    entity_id = er.async_get(hass).async_get_entity_id(
+        "sensor", DOMAIN, f"{ACCOUNT}_current_rate"
+    )
+    state = hass.states.get(entity_id)
+    assert state is not None
+    assert state.state in ("unknown", "unavailable")
+    for key in (
+        "tier_rate",
+        "fuel_adjustment_per_kwh",
+        "renewable_levy_per_kwh",
+        "next_tier_rate",
+        "plan_name",
+        "month_kwh",
+        "daily",
+    ):
+        assert key not in state.attributes
+
+
+async def test_current_rate_entity_has_no_diagnostic_category(hass):
+    """Current rate stays a primary sensor, not diagnostic."""
+    await _setup_with_payload(hass, _payload())
+    entity_id = er.async_get(hass).async_get_entity_id(
+        "sensor", DOMAIN, f"{ACCOUNT}_current_rate"
+    )
+    reg_entry = er.async_get(hass).async_get(entity_id)
+    assert reg_entry is not None
+    assert reg_entry.entity_category is None
+
+
+async def test_yesterday_attributes_unchanged_when_current_rate_present(hass):
+    """Aggregate attributes on yesterday_kwh are unaffected by current_rate."""
+    payload = _payload()
+    await _setup_with_payload(hass, payload)
+
+    state = hass.states.get(f"sensor.octopus_energy_{ACCOUNT_SLUG}_yesterday_usage")
+    assert state is not None
+    assert "daily" in state.attributes
+    assert state.attributes["avg_rate"] == payload["avg_rate"]
+    assert "tier_rate" not in state.attributes
+
+
+def test_current_rate_native_value_none_when_rate_missing():
+    """Unit-level: no rate in coordinator data reports None."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id=ACCOUNT, data=dict(ENTRY_DATA))
+    coordinator = MagicMock()
+    coordinator.data = {k: v for k, v in _payload().items() if k != "current_rate_kwh"}
+    sensor = OctopusSensor(coordinator, _by_key()["current_rate"], entry)
+    assert sensor.native_value is None
+    assert sensor.extra_state_attributes is None
+
+
+def test_current_rate_extra_attributes_none_without_coordinator_data():
+    """current_rate attributes stay absent when coordinator has no data."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id=ACCOUNT, data=dict(ENTRY_DATA))
+    coordinator = MagicMock()
+    coordinator.data = None
+    sensor = OctopusSensor(coordinator, _by_key()["current_rate"], entry)
+    assert sensor.extra_state_attributes is None
 
 
 @pytest.mark.parametrize("key", [description.key for description in SENSORS])
