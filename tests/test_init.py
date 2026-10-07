@@ -19,6 +19,7 @@ from custom_components.octopus_energy_jp import (
     async_unload_entry,
 )
 from custom_components.octopus_energy_jp.__init__ import (
+    _async_reload_on_update,
     _get_hourly,
     _hourly_signature,
 )
@@ -93,6 +94,31 @@ def test_get_hourly_and_signature_helpers() -> None:
     assert _hourly_signature([_Row()]) == (1, "object-start")
     assert _hourly_signature(["bad"]) == (1, "bad")
 
+    class _UnstrableStart:
+        def __str__(self) -> str:
+            raise ValueError("no str")
+
+    assert _hourly_signature([{"start": _UnstrableStart()}]) == (1, "")
+
+    class _LenAlwaysFails:
+        def __getitem__(self, _idx: int) -> dict[str, str]:
+            return {"start": "x"}
+
+        def __len__(self) -> int:
+            raise TypeError("no len")
+
+    assert _hourly_signature(_LenAlwaysFails()) == (0, "")
+
+
+async def test_async_reload_on_update_requests_entry_reload(hass) -> None:
+    entry = _new_entry()
+    entry.add_to_hass(hass)
+    with patch.object(
+        hass.config_entries, "async_reload", AsyncMock(return_value=True)
+    ) as mock_reload:
+        await _async_reload_on_update(hass, entry)
+    mock_reload.assert_awaited_once_with(entry.entry_id)
+
 
 async def test_setup_creates_all_sensors_and_unloads(hass):
     """Setup registers every sensor description and unload tears them down."""
@@ -141,6 +167,120 @@ async def test_setup_creates_both_importers_and_imports_at_setup(hass):
     assert mock_add.call_count == 2
     statistic_ids = {call.args[1]["statistic_id"] for call in mock_add.call_args_list}
     assert len(statistic_ids) == 2
+
+
+async def test_import_task_done_logs_task_exception(hass, caplog) -> None:
+    entry = _new_entry()
+    entry.add_to_hass(hass)
+    payload = _settled_hourly_payload()
+    tz = dt_util.get_time_zone("Asia/Tokyo")
+    assert tz is not None
+    previous = dt_util.DEFAULT_TIME_ZONE
+    dt_util.set_default_time_zone(tz)
+    caplog.set_level(logging.ERROR)
+    orig_create_task = hass.async_create_task
+
+    def wrap_create_task(coro):
+        inner = orig_create_task(coro)
+        report = MagicMock()
+        report.exception.return_value = RuntimeError("background import failed")
+
+        def add_done_callback(callback):
+            inner.add_done_callback(lambda _t: callback(report))
+
+        report.add_done_callback = add_done_callback
+        return report
+
+    try:
+        with (
+            _api_client_patch(),
+            _fetch_patch(payload),
+            freeze_time("2026-07-15 03:00:00"),
+            patch(
+                "custom_components.octopus_energy_jp.statistics.async_add_external_statistics"
+            ),
+            patch.object(hass, "async_create_task", side_effect=wrap_create_task),
+        ):
+            assert await hass.config_entries.async_setup(entry.entry_id)
+            await hass.async_block_till_done()
+
+            extended = {
+                "hourly": payload["hourly"]
+                + [
+                    {
+                        "start": payload["hourly"][-1]["start"] + timedelta(hours=4),
+                        "kwh": 0.2,
+                        "cost": 3.0,
+                    }
+                ]
+            }
+            entry.runtime_data["coordinator"].data = extended
+            entry.runtime_data["coordinator"].async_update_listeners()
+            await hass.async_block_till_done()
+    finally:
+        dt_util.set_default_time_zone(previous)
+
+    assert any(
+        "統計のインポートタスクが失敗しました" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+async def test_import_task_done_logs_when_exception_lookup_fails(hass, caplog) -> None:
+    entry = _new_entry()
+    entry.add_to_hass(hass)
+    payload = _settled_hourly_payload()
+    tz = dt_util.get_time_zone("Asia/Tokyo")
+    assert tz is not None
+    previous = dt_util.DEFAULT_TIME_ZONE
+    dt_util.set_default_time_zone(tz)
+    caplog.set_level(logging.ERROR)
+    orig_create_task = hass.async_create_task
+
+    def wrap_create_task(coro):
+        inner = orig_create_task(coro)
+        report = MagicMock()
+        report.exception.side_effect = RuntimeError("task state unavailable")
+
+        def add_done_callback(callback):
+            inner.add_done_callback(lambda _t: callback(report))
+
+        report.add_done_callback = add_done_callback
+        return report
+
+    try:
+        with (
+            _api_client_patch(),
+            _fetch_patch(payload),
+            freeze_time("2026-07-15 03:00:00"),
+            patch(
+                "custom_components.octopus_energy_jp.statistics.async_add_external_statistics"
+            ),
+            patch.object(hass, "async_create_task", side_effect=wrap_create_task),
+        ):
+            assert await hass.config_entries.async_setup(entry.entry_id)
+            await hass.async_block_till_done()
+
+            extended = {
+                "hourly": payload["hourly"]
+                + [
+                    {
+                        "start": payload["hourly"][-1]["start"] + timedelta(hours=5),
+                        "kwh": 0.3,
+                        "cost": 4.0,
+                    }
+                ]
+            }
+            entry.runtime_data["coordinator"].data = extended
+            entry.runtime_data["coordinator"].async_update_listeners()
+            await hass.async_block_till_done()
+    finally:
+        dt_util.set_default_time_zone(previous)
+
+    assert any(
+        "インポートタスクの状態取得に失敗しました" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 async def test_coordinator_update_imports_both_and_skips_unchanged_signature(hass):

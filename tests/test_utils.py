@@ -68,6 +68,12 @@ def test_marginal_rate_kwh_empty_and_beyond_last_tier() -> None:
     assert utils.marginal_rate_kwh(250.0, finite_only) == 12.0
 
 
+def test_marginal_rate_kwh_skips_open_tier_below_start() -> None:
+    """Usage below an open-ended tier's start falls through to the last price."""
+    rates = [(300.0, None, 40.0)]
+    assert utils.marginal_rate_kwh(50.0, rates) == 40.0
+
+
 def test_next_tier_rate_kwh() -> None:
     rates = [(0.0, 120.0, 30.0), (120.0, 300.0, 36.0), (300.0, None, 40.0)]
     assert utils.next_tier_rate_kwh(50.0, rates) == 36.0
@@ -75,6 +81,11 @@ def test_next_tier_rate_kwh() -> None:
     assert utils.next_tier_rate_kwh(350.0, rates) is None
     assert utils.next_tier_rate_kwh(10.0, []) is None
     assert utils.next_tier_rate_kwh(500.0, [(0.0, None, 9.0)]) is None
+
+
+def test_next_tier_rate_kwh_no_matching_tier_returns_none() -> None:
+    rates = [(120.0, 300.0, 36.0)]
+    assert utils.next_tier_rate_kwh(50.0, rates) is None
 
 
 def test_normalize_rates_sorts_and_coerces() -> None:
@@ -625,6 +636,36 @@ def test_tiered_cost_normal_multi_tier_ladder() -> None:
     assert utils.tiered_cost(350, rates) == pytest.approx(
         3600.0 + 180 * 35.0 + 50 * 40.0
     )
+
+
+def test_reading_instant_key_naive_iso_returns_naive_datetime() -> None:
+    key = utils._reading_instant_key("2026-07-01T12:30:00")
+    assert isinstance(key, datetime)
+    assert key.tzinfo is None
+    assert key.hour == 12
+
+
+def test_compare_version_strings_defensive_on_bad_types() -> None:
+    assert utils._compare_version_strings(None, "1.0") == 0
+    assert utils._compare_version_strings("1.0", None) == 0
+
+
+def test_select_latest_bill_skips_non_dict_edges() -> None:
+    bills = {
+        "edges": [
+            None,
+            "skip-me",
+            {
+                "billType": "STATEMENT",
+                "fromDate": "2026-07-01",
+                "toDate": "2026-07-31",
+                "issuedDate": "2026-08-01",
+            },
+        ]
+    }
+    result = utils.select_latest_bill(bills)
+    assert result is not None
+    assert result["from_date"] == "2026-07-01"
 
 
 def test_deduplicate_readings_collapses_equivalent_instants() -> None:
