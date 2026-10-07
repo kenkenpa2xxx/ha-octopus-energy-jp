@@ -92,9 +92,11 @@ Energy Dashboard 用の外部統計を提供します。
 | 昨日の料金 / 当日の料金 / 当月の料金 / 前月の料金 | JPY | 段階制料金による概算 |
 | 請求期間の使用量 | kWh | 検針期間（billing）の累計使用量（センサーID: `billing_kwh`） |
 | 請求期間の料金 | JPY | 検針期間の概算料金。オプション設定時は基本料金・燃料費調整額・再エネ賦課金を加算（センサーID: `billing_cost`） |
-| 現在の単価 | JPY/kWh | 段階制の限界単価＋燃料費調整額＋再エネ賦課金（センサーID: `current_rate`）。属性に `tier_rate` / `next_tier_rate` / `plan_name` / `month_kwh` |
+| 現在の単価 | JPY/kWh | 段階制の限界単価＋燃料費調整額＋再エネ賦課金（キー: `current_rate`）。属性に `tier_rate` / `next_tier_rate`（いずれも税込の段階単価で、サーチャージは含まず）/ `plan_name` / `month_kwh` |
 
-`現在の単価`（`current_rate`）は当月の使用量から決まる**現在適用中の従量単価**で、
+（表中のカッコ内は連携内部のキーです。実際のエンティティIDは表示名から生成され、例: `sensor.octopus_energy_a_b00c43a0_yesterday_usage`、単価は `sensor.octopus_energy_<account>_current_unit_rate`）
+
+`現在の単価` は当月の使用量から決まる**現在適用中の従量単価**（= `tier_rate` ＋ 燃料費調整額 ＋ 再エネ賦課金）で、
 「単価が安い時間帯に家電を回す」といった自動化に使えます。料金表の改定や当月累計が
 次の段階に入ると値が変わります。
 
